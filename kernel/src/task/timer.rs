@@ -138,6 +138,7 @@ pub struct TimeManager {
     last_wall_ns: usize,
     state: TimerState,
     itimers: [ITimer; 3],
+    timers_armed: bool,
 }
 
 impl Default for TimeManager {
@@ -154,6 +155,7 @@ impl TimeManager {
             last_wall_ns: 0,
             state: TimerState::None,
             itimers: Default::default(),
+            timers_armed: false,
         }
     }
 
@@ -170,19 +172,25 @@ impl TimeManager {
         let now_ns = monotonic_time_nanos() as usize;
         let delta = now_ns - self.last_wall_ns;
         match self.state {
-            TimerState::User => {
-                self.utime_ns += delta;
-                self.update_itimer(ITimerType::Virtual, delta, &emitter);
-                self.update_itimer(ITimerType::Prof, delta, &emitter);
-            }
-            TimerState::Kernel => {
-                self.stime_ns += delta;
-                self.update_itimer(ITimerType::Prof, delta, &emitter);
-            }
+            TimerState::User => self.utime_ns += delta,
+            TimerState::Kernel => self.stime_ns += delta,
             TimerState::None => {}
         }
-        self.update_itimer(ITimerType::Real, delta, &emitter);
+        if self.timers_armed {
+            self.poll_itimers(delta, emitter);
+        }
         self.last_wall_ns = now_ns;
+    }
+
+    #[inline(never)]
+    fn poll_itimers(&mut self, delta: usize, emitter: impl Fn(Signo)) {
+        if matches!(self.state, TimerState::User) {
+            self.update_itimer(ITimerType::Virtual, delta, &emitter);
+        }
+        if !matches!(self.state, TimerState::None) {
+            self.update_itimer(ITimerType::Prof, delta, &emitter);
+        }
+        self.update_itimer(ITimerType::Real, delta, &emitter);
     }
 
     /// Updates the timer state.
@@ -202,6 +210,7 @@ impl TimeManager {
             &mut self.itimers[ty as usize],
             ITimer::new(interval_ns, remained_ns),
         );
+        self.refresh_armed();
         (
             time_value_from_nanos(old.interval_ns),
             time_value_from_nanos(old.remained_ns),
@@ -217,8 +226,13 @@ impl TimeManager {
         )
     }
 
+    fn refresh_armed(&mut self) {
+        self.timers_armed = self.itimers.iter().any(|timer| timer.remained_ns != 0);
+    }
+
     fn update_itimer(&mut self, ty: ITimerType, delta: usize, emitter: impl Fn(Signo)) {
         if self.itimers[ty as usize].update(delta) {
+            self.refresh_armed();
             emitter(ty.signo());
         }
     }
