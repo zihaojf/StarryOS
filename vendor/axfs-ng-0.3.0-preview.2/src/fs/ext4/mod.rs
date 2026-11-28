@@ -25,6 +25,10 @@ impl BlockDevice for Ext4Disk {
         Ok(buf.len())
     }
 
+    fn flush(&mut self) -> Ext4Result<()> {
+        self.0.flush().map_err(|_| Ext4Error::new(EIO as _, None))
+    }
+
     fn num_blocks(&self) -> Ext4Result<u64> {
         Ok(self.0.num_blocks())
     }

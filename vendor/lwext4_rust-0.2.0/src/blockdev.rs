@@ -16,6 +16,11 @@ pub trait BlockDevice {
     /// Reads blocks from the device, starting from the given block ID.
     fn read_blocks(&mut self, block_id: u64, buf: &mut [u8]) -> Ext4Result<usize>;
 
+    /// Commits acknowledged writes if the device has a volatile cache.
+    fn flush(&mut self) -> Ext4Result<()> {
+        Ok(())
+    }
+
     /// Gets the number of blocks on the device.
     fn num_blocks(&self) -> Ext4Result<u64>;
 }
@@ -87,6 +92,10 @@ impl<Dev: BlockDevice> Ext4BlockDevice<Dev> {
                 block_dev_iface,
             },
         })
+    }
+
+    pub(crate) fn flush_device(&mut self) -> Ext4Result<()> {
+        self._guard.dev.flush()
     }
 
     unsafe fn dev_read_fields<'a>(

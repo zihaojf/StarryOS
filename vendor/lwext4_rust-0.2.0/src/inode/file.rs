@@ -277,12 +277,6 @@ impl<Hal: SystemHal> InodeRef<Hal> {
             let block_size = get_block_size(self.superblock());
             let old_blocks = cur_len.div_ceil(block_size as u64) as u32;
             let new_blocks = len.div_ceil(block_size as u64) as u32;
-            for block in old_blocks..new_blocks {
-                let (fblock, new_block) = self.append_inode_fblock()?;
-                assert_eq!(block, new_block);
-                self.write_bytes(fblock * block_size as u64, &EMPTY[..block_size as usize])?;
-            }
-
             // Newly allocated blocks are already zero. Only an old partial
             // block may contain bytes hidden by a previous truncation.
             let offset = cur_len % u64::from(block_size);
@@ -296,6 +290,38 @@ impl<Hal: SystemHal> InodeRef<Hal> {
                         &EMPTY[..length as usize],
                     )?;
                 }
+            }
+
+            // Adjacent allocations can be initialized with one device request.
+            // Roll back the new extent if either allocation or zeroing fails.
+            let grow = (|| {
+                let mut run_start = 0;
+                let mut run_bytes = 0;
+                for block in old_blocks..new_blocks {
+                    let (fblock, new_block) = self.append_inode_fblock()?;
+                    assert_eq!(block, new_block);
+                    let offset = fblock * u64::from(block_size);
+                    if run_bytes != 0 && offset != run_start + run_bytes as u64 {
+                        self.write_bytes(run_start, &EMPTY[..run_bytes])?;
+                        run_bytes = 0;
+                    }
+                    if run_bytes == 0 {
+                        run_start = offset;
+                    }
+                    run_bytes += block_size as usize;
+                    if run_bytes == EMPTY.len() {
+                        self.write_bytes(run_start, &EMPTY)?;
+                        run_bytes = 0;
+                    }
+                }
+                if run_bytes != 0 {
+                    self.write_bytes(run_start, &EMPTY[..run_bytes])?;
+                }
+                Ok(())
+            })();
+            if let Err(err) = grow {
+                self.truncate(cur_len)?;
+                return Err(err);
             }
 
             unsafe {

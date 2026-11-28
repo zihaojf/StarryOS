@@ -278,7 +278,7 @@ impl<Hal: SystemHal, Dev: BlockDevice> Ext4Filesystem<Hal, Dev> {
                 ext4_sb_write(fs.bdev, &mut fs.sb).context("ext4_sb_write")?;
             }
         }
-        Ok(())
+        self.bdev.flush_device()
     }
 }
 

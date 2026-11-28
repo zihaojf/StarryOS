@@ -504,7 +504,9 @@ impl CachedFile {
             let page_start = pn as u64 * PAGE_SIZE as u64;
             let len = (file.len()?.saturating_sub(page_start)).min(PAGE_SIZE as u64) as usize;
             if len > 0 {
-                file.write_at(&page.data()[..len], page_start)?;
+                if file.write_at(&page.data()[..len], page_start)? != len {
+                    return Err(VfsError::Io);
+                }
             }
             page.dirty = false;
         }
@@ -522,14 +524,7 @@ impl CachedFile {
         if cache.contains(&pn) {
             return Ok((cache.get_mut(&pn).unwrap(), None));
         }
-        let mut evicted = None;
-        if cache.len() == cache.cap().get() {
-            // Cache is full, remove the least recently used page
-            if let Some((pn, mut page)) = cache.pop_lru() {
-                self.evict_cache(file, pn, &mut page)?;
-                evicted = Some((pn, page));
-            }
-        }
+        let evicted = self.make_room(file, cache)?;
 
         // Page not in cache, read it
         let mut page = PageCache::new()?;
@@ -542,6 +537,29 @@ impl CachedFile {
         }
         cache.put(pn, page);
         Ok((cache.get_mut(&pn).unwrap(), evicted))
+    }
+
+    fn evict_lru(
+        &self,
+        file: &FileNode,
+        cache: &mut LruCache<u32, PageCache>,
+    ) -> VfsResult<Option<(u32, PageCache)>> {
+        if let Some((&pn, _)) = cache.peek_lru() {
+            self.evict_cache(file, pn, cache.peek_mut(&pn).unwrap())?;
+        }
+        Ok(cache.pop_lru())
+    }
+
+    fn make_room(
+        &self,
+        file: &FileNode,
+        cache: &mut LruCache<u32, PageCache>,
+    ) -> VfsResult<Option<(u32, PageCache)>> {
+        if cache.len() == cache.cap().get() {
+            self.evict_lru(file, cache)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Invokes `f` with the cached page at `pn`, or `None` if it is not cached.
@@ -610,24 +628,44 @@ impl CachedFile {
     }
 
     fn write_at_locked(&self, mut buf: impl Read + IoBuf, offset: u64) -> VfsResult<usize> {
-        let end = offset + buf.remaining() as u64;
-        self.with_pages(
-            offset..end,
-            |file| {
-                if end > file.len()? {
-                    file.set_len(end)?;
+        let end = offset.checked_add(buf.remaining() as u64).ok_or(VfsError::InvalidInput)?;
+        if offset == end {
+            return Ok(0);
+        }
+        let file = self.inner.entry().as_file()?;
+        {
+            let _cache = self.shared.page_cache.lock();
+            if end > file.len()? {
+                file.set_len(end)?;
+            }
+        }
+        let mut written = 0;
+        while buf.remaining() != 0 {
+            let pos = offset + written as u64;
+            let pn = (pos / PAGE_SIZE as u64) as u32;
+            let start = (pos % PAGE_SIZE as u64) as usize;
+            let count = buf.remaining().min(PAGE_SIZE - start);
+            let mut cache = self.shared.page_cache.lock();
+            if count == PAGE_SIZE && !cache.contains(&pn) {
+                // The old bytes are all replaced. Publish only after the input
+                // copy and any necessary eviction have both succeeded.
+                self.make_room(file, &mut cache)?;
+                let mut page = PageCache::new()?;
+                buf.read_exact(page.data())?;
+                page.dirty = !self.in_memory;
+                cache.put(pn, page);
+                written += count;
+            } else {
+                let page = self.page_or_insert(file, &mut cache, pn)?.0;
+                let n = buf.read(&mut page.data()[start..start + count])?;
+                if n == 0 {
+                    break;
                 }
-                Ok(0)
-            },
-            |written, page, range| {
-                let len = range.end - range.start;
-                buf.read(&mut page.data()[range.start..range.end])?;
-                if !self.in_memory {
-                    page.dirty = true;
-                }
-                Ok(written + len)
-            },
-        )
+                page.dirty |= !self.in_memory;
+                written += n;
+            }
+        }
+        Ok(written)
     }
 
     /// Writes `buf` to the file at `offset`.
@@ -648,13 +686,13 @@ impl CachedFile {
     /// Truncates or extends the file to `len` bytes.
     pub fn set_len(&self, len: u64) -> VfsResult<()> {
         let file = self.inner.entry().as_file()?;
+        let mut guard = self.shared.page_cache.lock();
         let old_len = file.len()?;
         file.set_len(len)?;
 
         let old_last_page = (old_len / PAGE_SIZE as u64) as u32;
         let new_last_page = (len / PAGE_SIZE as u64) as u32;
         if old_len < len {
-            let mut guard = self.shared.page_cache.lock();
             if let Some(page) = guard.get_mut(&old_last_page) {
                 let page_start = old_last_page as u64 * PAGE_SIZE as u64;
                 let old_page_offset = (old_len - page_start) as usize;
@@ -665,7 +703,6 @@ impl CachedFile {
             // For truncating, we need to remove all pages that are beyond the
             // new length
             // TODO(mivik): can this be more efficient?
-            let mut guard = self.shared.page_cache.lock();
             let keys = guard
                 .iter()
                 .map(|(k, _)| *k)
@@ -691,10 +728,53 @@ impl CachedFile {
         }
         let file = self.inner.entry().as_file()?;
         let mut guard = self.shared.page_cache.lock();
-        while let Some((pn, mut page)) = guard.pop_lru() {
-            self.evict_cache(file, pn, &mut page)?;
+        // With a shared mapping the eviction callback revokes writable PTEs,
+        // so the next store will fault and mark its page dirty again.
+        if !self.shared.evict_listeners.lock().is_empty() {
+            while self.evict_lru(file, &mut guard)?.is_some() {}
+            return file.sync(data_only);
+        }
+        let mut dirty: Vec<u32> = guard.iter().filter(|(_, p)| p.dirty).map(|(&pn, _)| pn).collect();
+        if dirty.is_empty() {
+            guard.clear();
+            return file.sync(data_only);
+        }
+        dirty.sort_unstable();
+        let len = file.len()?;
+        const MAX_BATCH: usize = 16;
+        let mut buffer = Vec::new();
+        let limit = dirty.len().min(MAX_BATCH);
+        let batch = if limit > 1 && buffer.try_reserve_exact(limit * PAGE_SIZE).is_ok() { limit } else { 1 };
+        let mut pending = dirty.as_slice();
+        while let Some((&first, _)) = pending.split_first() {
+            let mut count = 1;
+            while count < pending.len() && count < batch && pending[count] - first == count as u32 {
+                count += 1;
+            }
+            let offset = u64::from(first) * PAGE_SIZE as u64;
+            let bytes = len.saturating_sub(offset).min((count * PAGE_SIZE) as u64) as usize;
+            if bytes != 0 {
+                let source = if count == 1 {
+                    guard.peek_mut(&first).unwrap().data()
+                } else {
+                    buffer.clear();
+                    for pn in &pending[..count] {
+                        buffer.extend_from_slice(guard.peek_mut(pn).unwrap().data());
+                    }
+                    buffer.as_slice()
+                };
+                if file.write_at(&source[..bytes], offset)? != bytes {
+                    return Err(VfsError::Io);
+                }
+            }
+            pending = &pending[count..];
         }
         file.sync(data_only)?;
+        for pn in dirty {
+            guard.peek_mut(&pn).unwrap().dirty = false;
+        }
+        // Keep sync's existing cache invalidation semantics for direct I/O.
+        guard.clear();
         Ok(())
     }
 
@@ -907,7 +987,8 @@ impl File {
     /// metadata.
     pub fn sync(&self, data_only: bool) -> VfsResult<()> {
         self.access(FileFlags::empty())?;
-        self.inner.sync(data_only)
+        self.inner.sync(data_only)?;
+        self.inner.location().filesystem().flush()
     }
 
     /// Reads data from the current position, advancing the cursor.
